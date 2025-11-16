@@ -1,116 +1,201 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-# API-Key von Hetzner (ersetzen!)
-HETZNER_API_KEY="hetzner-API-Key"
+########################################
+# Konfiguration
+########################################
 
-# Liste der Domains und Subdomains, die aktualisiert werden sollen
+# Hetzner Cloud API Token (Projekt-Token aus der Cloud Console)
+HETZNER_API_TOKEN=""
+
+# Basis-URL der Hetzner Cloud API
+HETZNER_API_URL="https://api.hetzner.cloud/v1"
+
+# Debug-Ausgabe aktivieren: DEBUG=1 bash dns-update.sh
+DEBUG="${DEBUG:-0}"
+
+# Liste der FQDNs, für die A/AAAA gesetzt werden sollen
 DOMAINS=(
-    "domain.tld"
+  "domain.tld"
+  "sub.domain.tld"
 )
 
-# API URL
-HETZNER_API_URL="https://dns.hetzner.com/api/v1"
+########################################
+# Hilfsfunktionen
+########################################
 
-# Aktuelle öffentliche IPv4- und IPv6-Adresse abrufen
-CURRENT_IPV4=$(curl -s https://ipv4.icanhazip.com)
-CURRENT_IPV6=$(curl -s https://ipv6.icanhazip.com)
-
-# Funktion zum Aktualisieren einer einzelnen Domain für IPv4 & IPv6
-update_domain() {
-    local DOMAIN=$1
-    local MAIN_DOMAIN=$(echo $DOMAIN | awk -F'.' '{print $(NF-1)"."$NF}')  # Hauptdomain extrahieren
-    local SUBDOMAIN=${DOMAIN/.$MAIN_DOMAIN/}
-
-    # Falls die Subdomain leer ist (also die Hauptdomain), setze sie explizit auf "@"
-    if [[ "$SUBDOMAIN" == "$DOMAIN" ]]; then
-        SUBDOMAIN="@"
-    fi
-
-    # Zone-ID abrufen
-    ZONE_ID=$(curl -s -H "Auth-API-Token: $HETZNER_API_KEY" "$HETZNER_API_URL/zones" | jq -r ".zones[] | select(.name==\"$MAIN_DOMAIN\") | .id")
-
-    if [[ -z "$ZONE_ID" ]]; then
-        echo "Fehler: Konnte Zone für $DOMAIN nicht finden!"
-        return
-    fi
-
-    # Aktuelle DNS-Einträge abrufen
-    RECORDS=$(curl -s -H "Auth-API-Token: $HETZNER_API_KEY" "$HETZNER_API_URL/records?zone_id=$ZONE_ID")
-
-    # IPv4-A-Record aktualisieren
-    RECORD_ID_A=$(echo "$RECORDS" | jq -r ".records[] | select(.name==\"$SUBDOMAIN\" and .type==\"A\") | .id")
-    EXISTING_IPV4=$(echo "$RECORDS" | jq -r ".records[] | select(.name==\"$SUBDOMAIN\" and .type==\"A\") | .value")
-
-    if [[ "$EXISTING_IPV4" == "$CURRENT_IPV4" ]]; then
-        echo "[$DOMAIN] IPv4 ist aktuell ($CURRENT_IPV4), kein Update nötig."
-    else
-        if [[ -z "$RECORD_ID_A" ]]; then
-            echo "[$DOMAIN] Erstelle neuen A-Record mit IP $CURRENT_IPV4..."
-            curl -s -X POST "$HETZNER_API_URL/records" \
-                -H "Auth-API-Token: $HETZNER_API_KEY" \
-                -H "Content-Type: application/json" \
-                -d "{
-                    \"zone_id\": \"$ZONE_ID\",
-                    \"type\": \"A\",
-                    \"name\": \"$SUBDOMAIN\",
-                    \"value\": \"$CURRENT_IPV4\",
-                    \"ttl\": 60
-                }"
-        else
-            echo "[$DOMAIN] Aktualisiere A-Record auf $CURRENT_IPV4..."
-            curl -s -X PUT "$HETZNER_API_URL/records/$RECORD_ID_A" \
-                -H "Auth-API-Token: $HETZNER_API_KEY" \
-                -H "Content-Type: application/json" \
-                -d "{
-                    \"zone_id\": \"$ZONE_ID\",
-                    \"type\": \"A\",
-                    \"name\": \"$SUBDOMAIN\",
-                    \"value\": \"$CURRENT_IPV4\",
-                    \"ttl\": 60
-                }"
-        fi
-    fi
-
-    # IPv6-AAAA-Record aktualisieren
-    if [[ -n "$CURRENT_IPV6" ]]; then
-        RECORD_ID_AAAA=$(echo "$RECORDS" | jq -r ".records[] | select(.name==\"$SUBDOMAIN\" and .type==\"AAAA\") | .id")
-        EXISTING_IPV6=$(echo "$RECORDS" | jq -r ".records[] | select(.name==\"$SUBDOMAIN\" and .type==\"AAAA\") | .value")
-
-        if [[ "$EXISTING_IPV6" == "$CURRENT_IPV6" ]]; then
-            echo "[$DOMAIN] IPv6 ist aktuell ($CURRENT_IPV6), kein Update nötig."
-        else
-            if [[ -z "$RECORD_ID_AAAA" ]]; then
-                echo "[$DOMAIN] Erstelle neuen AAAA-Record mit IP $CURRENT_IPV6..."
-                curl -s -X POST "$HETZNER_API_URL/records" \
-                    -H "Auth-API-Token: $HETZNER_API_KEY" \
-                    -H "Content-Type: application/json" \
-                    -d "{
-                        \"zone_id\": \"$ZONE_ID\",
-                        \"type\": \"AAAA\",
-                        \"name\": \"$SUBDOMAIN\",
-                        \"value\": \"$CURRENT_IPV6\",
-                        \"ttl\": 60
-                    }"
-            else
-                echo "[$DOMAIN] Aktualisiere AAAA-Record auf $CURRENT_IPV6..."
-                curl -s -X PUT "$HETZNER_API_URL/records/$RECORD_ID_AAAA" \
-                    -H "Auth-API-Token: $HETZNER_API_KEY" \
-                    -H "Content-Type: application/json" \
-                    -d "{
-                        \"zone_id\": \"$ZONE_ID\",
-                        \"type\": \"AAAA\",
-                        \"name\": \"$SUBDOMAIN\",
-                        \"value\": \"$CURRENT_IPV6\",
-                        \"ttl\": 60
-                    }"
-            fi
-        fi
-    fi
+log() {
+  echo -e "$*" >&2
 }
 
-# Script für alle Domains ausführen
+# ruft die Cloud-API auf und gibt "BODY\nHTTP_CODE" zurück
+curl_hcloud() {
+  local method=$1
+  local path=$2
+  local data=${3:-}
+
+  local url="${HETZNER_API_URL}${path}"
+
+  if [[ "$DEBUG" == "1" ]]; then
+    log ">>> ${method} ${url}"
+    [[ -n "$data" ]] && log ">>> Body: $data"
+  fi
+
+  if [[ -n "$data" ]]; then
+    curl -sS -X "$method" \
+      -H "Authorization: Bearer ${HETZNER_API_TOKEN}" \
+      -H "Content-Type: application/json" \
+      -w "\n%{http_code}" \
+      -d "$data" \
+      "$url"
+  else
+    curl -sS -X "$method" \
+      -H "Authorization: Bearer ${HETZNER_API_TOKEN}" \
+      -H "Content-Type: application/json" \
+      -w "\n%{http_code}" \
+      "$url"
+  fi
+}
+
+# Zone-Name aus FQDN ableiten (letzte zwei Labels, passt für .de/.net/.com/.space/.social etc.)
+get_zone_name() {
+  local fqdn=$1
+  awk -F'.' '{print $(NF-1)"."$NF}' <<< "$fqdn"
+}
+
+# RR-Name innerhalb der Zone bestimmen
+# apex: "@", sonst Teil vor der Zone
+get_rr_name() {
+  local fqdn=$1
+  local zone=$2
+
+  if [[ "$fqdn" == "$zone" ]]; then
+    echo "@"
+  else
+    local suffix=".$zone"
+    echo "${fqdn%$suffix}"
+  fi
+}
+
+# A/AAAA RRSet setzen (mittels set_records)
+update_rrset_ip() {
+  local fqdn=$1
+  local rr_type=$2   # A oder AAAA
+  local ip_value=$3
+
+  local zone rr_name response http_code body rr_count existing_value payload
+
+  zone=$(get_zone_name "$fqdn")
+  rr_name=$(get_rr_name "$fqdn" "$zone")
+  rr_name=$(tr 'A-Z' 'a-z' <<< "$rr_name")
+
+  log ""
+  log "🔎 Prüfe ${fqdn} (Zone: ${zone}, RR-Name: ${rr_name}, Typ: ${rr_type})"
+
+  # 1) RRSet suchen
+  response=$(curl_hcloud "GET" "/zones/${zone}/rrsets?name=${rr_name}&type[]=${rr_type}")
+  http_code=$(printf '%s\n' "$response" | tail -n1)
+  body=$(printf '%s\n' "$response" | sed '$d')
+
+  if [[ "$DEBUG" == "1" ]]; then
+    log "<<< HTTP ${http_code}"
+    log "<<< Body: $body"
+  fi
+
+  if [[ "$http_code" -eq 404 ]]; then
+    log "⚠  Zone ${zone} nicht gefunden (HTTP 404) – stimmt Projekt/Token?"
+    return
+  elif [[ "$http_code" -ge 400 ]]; then
+    log "⚠  Fehler beim Abrufen des RRSets (HTTP ${http_code})"
+    return
+  fi
+
+  rr_count=$(jq '.rrsets | length' <<< "$body" 2>/dev/null || echo 0)
+
+  if [[ "$rr_count" -eq 0 ]]; then
+    # RRSet existiert noch nicht → neu anlegen
+    log "➕ Kein ${rr_type}-RRSet vorhanden, lege neues an..."
+
+    payload=$(jq -n \
+      --arg name "$rr_name" \
+      --arg type "$rr_type" \
+      --arg value "$ip_value" \
+      '{
+        name: $name,
+        type: $type,
+        ttl: 60,
+        records: [
+          { "value": $value }
+        ]
+      }')
+
+    response=$(curl_hcloud "POST" "/zones/${zone}/rrsets" "$payload")
+    http_code=$(printf '%s\n' "$response" | tail -n1)
+    body=$(printf '%s\n' "$response" | sed '$d')
+
+    if [[ "$http_code" -ge 400 ]]; then
+      log "❌ Fehler beim Erstellen des ${rr_type}-RRSets (HTTP ${http_code})"
+      [[ "$DEBUG" == "1" ]] && log "Antwort: $body"
+    else
+      log "✅ ${rr_type}-RRSet erstellt: ${fqdn} → ${ip_value}"
+      [[ "$DEBUG" == "1" ]] && log "Antwort: $body"
+    fi
+  else
+    # RRSet existiert → aktuelle IP auslesen
+    existing_value=$(jq -r '.rrsets[0].records[0].value // empty' <<< "$body")
+
+    if [[ "$existing_value" == "$ip_value" ]]; then
+      log "✅ ${rr_type}-RRSet bereits korrekt: ${fqdn} → ${ip_value} (keine Änderung notwendig)"
+      return
+    fi
+
+    log "🔁 Ändere ${rr_type}-RRSet: ${fqdn} ${existing_value:-"<leer>"} → ${ip_value}"
+
+    payload=$(jq -n --arg value "$ip_value" '{
+      records: [
+        { "value": $value }
+      ]
+    }')
+
+    response=$(curl_hcloud "POST" "/zones/${zone}/rrsets/${rr_name}/${rr_type}/actions/set_records" "$payload")
+    http_code=$(printf '%s\n' "$response" | tail -n1)
+    body=$(printf '%s\n' "$response" | sed '$d')
+
+    if [[ "$http_code" -ge 400 ]]; then
+      log "❌ Fehler beim Setzen der Records (HTTP ${http_code})"
+      [[ "$DEBUG" == "1" ]] && log "Antwort: $body"
+    else
+      log "✅ ${rr_type}-RRSet aktualisiert: ${fqdn} → ${ip_value}"
+      [[ "$DEBUG" == "1" ]] && log "Antwort: $body"
+    fi
+  fi
+}
+
+########################################
+# Start
+########################################
+
+CURRENT_IPV4=$(curl -s https://ipv4.icanhazip.com | tr -d '[:space:]')
+CURRENT_IPV6=$(curl -s https://ipv6.icanhazip.com | tr -d '[:space:]')
+
+log "🌍 Aktuelle IPv4 (WAN): ${CURRENT_IPV4:-"<keine>"}"
+log "🌍 Aktuelle IPv6 (WAN): ${CURRENT_IPV6:-"<keine>"}"
+log ""
+
+if [[ -z "$CURRENT_IPV4" && -z "$CURRENT_IPV6" ]]; then
+  log "❌ Konnte weder IPv4 noch IPv6 ermitteln – abbrechen."
+  exit 1
+fi
+
 for DOMAIN in "${DOMAINS[@]}"; do
-    update_domain "$DOMAIN"
+  if [[ -n "$CURRENT_IPV4" ]]; then
+    update_rrset_ip "$DOMAIN" "A" "$CURRENT_IPV4"
+  fi
+
+  if [[ -n "$CURRENT_IPV6" ]]; then
+    update_rrset_ip "$DOMAIN" "AAAA" "$CURRENT_IPV6"
+  fi
 done
 
-echo "DNS-Update abgeschlossen!"
+log ""
+log "✅ DNS-Update über Hetzner Cloud DNS abgeschlossen."
